@@ -325,7 +325,7 @@ struct PairEq {
         return x.a == y.a && x.b == y.b;
     }
 };
-std::unordered_map<PairKey, double, PairHash, PairEq> kin_cache;
+//std::unordered_map<PairKey, double, PairHash, PairEq> kin_cache;
 
 // recursion guards
 static thread_local std::unordered_set<std::string> F_stack;
@@ -389,18 +389,21 @@ double getKinship(const std::string& A, const std::string& B) {
     // symmetric
     PairKey key = (A < B) ? PairKey{ A, B } : PairKey{ B, A };
 
-    // 1) in-memory
-    if (auto it = kin_cache.find(key); it != kin_cache.end()) return it->second;
-
-    // 2) LRU / RocksDB
+    // 1) LRU / RocksDB だけ使う
     {
         std::string dbkey = kK(key.a, key.b);
         double v;
-        if (lruGet(dbkey, v)) { kin_cache[key] = v; return v; }
-        if (dbGetDouble(dbkey, v)) { lruPut(dbkey, v); kin_cache[key] = v; return v; }
+        if (lruGet(dbkey, v)) {
+            return v;
+        }
+        if (dbGetDouble(dbkey, v)) {
+            // RocksDB 命中した分も LRU にだけ積む
+            lruPut(dbkey, v);
+            return v;
+        }
     }
 
-    // recursion guard (pathological loops)
+    // recursion guard
     std::string guardKey = key.a + "|" + key.b;
     if (kin_stack.count(guardKey)) return 0.0;
     kin_stack.insert(guardKey);
@@ -441,11 +444,9 @@ double getKinship(const std::string& A, const std::string& B) {
         }
     }
 
-
     kin_stack.erase(guardKey);
 
-    // save caches
-    kin_cache[key] = res;
+    // RocksDB + LRU にだけ保存
     std::string dbkey = kK(key.a, key.b);
     lruPut(dbkey, res);
     dbPutDouble(dbkey, res);
@@ -641,26 +642,65 @@ void saveInbreedingList(const std::string& filename,
     const std::vector<std::string>& targets)
 {
     std::ofstream ofs(filename);
-    if (!ofs) { std::cerr << "cannot open " << filename << "\n"; return; }
+    if (!ofs) {
+        std::cerr << "cannot open " << filename << "\n";
+        return;
+    }
 
-    ofs << std::fixed << std::setprecision(8);
-    ofs << "HorseName,F\n";
+    ofs << std::fixed << std::setprecision(12);
+
+    // ここで input CSV 由来の情報をできるだけ出す
+    // PrimaryKey, HorseName, YearStr, YearInt, Sire, Dam, F, Fpct(%) など
+    ofs
+        << "PrimaryKey,"
+        << "HorseName,"
+        << "YearStr,"
+        << "SirePK,"
+        << "DamPK,"
+        << "F,"
+        << "FPercentTrunc5\n";
 
     size_t idx = 0, total = targets.size();
     for (const auto& pk : targets) {
         idx++;
+
         double F = getInbreeding(pk);
-        double pct = toPercentTrunc5(F);
+        double pct = toPercentTrunc5(F);  // さっき定義してるやつそのまま利用
 
-        std::cout << "[F] (" << idx << "/" << total << ") "
-            << keyToDisplayName[pk] << " "
-            << "[calc: " << std::fixed << std::setprecision(5) << pct << "%]\n";
+        // Horse 情報を拾う（存在しない PK だった場合でも落ちないように）
+        const Horse* hptr = nullptr;
+        auto it = horses.find(pk);
+        if (it != horses.end()) {
+            hptr = &it->second;
+        }
 
-        ofs << csvEscape(keyToDisplayName[pk]) << "," << std::setprecision(8) << F << "\n";
+        std::string horseName = keyToDisplayName.count(pk)
+            ? keyToDisplayName[pk]
+            : (hptr ? hptr->HorseName : pk);
+
+            std::string yearStr = (hptr ? hptr->YearStr : "");
+            std::string sirePk = (hptr ? hptr->Sire : "");
+            std::string damPk = (hptr ? hptr->Dam : "");
+
+            std::cout << "[F] (" << idx << "/" << total << ") "
+                << horseName << " "
+                << "[calc: " << std::fixed << std::setprecision(5)
+                << pct << "%]\n";
+
+            ofs
+                << pk << ","                                          // PrimaryKey
+                << csvEscape(horseName) << ","                        // HorseName（表示名）
+                << csvEscape(yearStr) << ","                          // YearStr (文字列)
+                << sirePk << ","                                      // SirePK
+                << damPk << ","                                       // DamPK
+                << std::setprecision(12) << F << ","                  // F(0-1)
+                << std::setprecision(5) << pct                       // F%
+                << "\n";
     }
 
     std::cout << "[done] " << filename << "\n";
 }
+
 
 void saveKinshipMatrix(const std::string& filename,
     const std::vector<std::string>& rows,
@@ -1348,7 +1388,15 @@ int main() {
     std::string f5 = "D:/AI/C++/out/inbreeding_terms_sum_of_" + idLabel + ".csv";
 
     saveInbreedingList(f1, targetPks);
+    // 行列出力の前
+    lru.clear();
+    order.clear();
+
     saveKinshipMatrix(f2, allKeys, targetPks);
+
+    // 必要ならまた clear
+    lru.clear();
+    order.clear();
     //saveKinshipMatrix(f3, targetPks, allKeys);
     //saveInbreedingTermsFiles(f4, f5, targetPks, MAX_PATH_DEPTH);
     int globalDepth = 0;
