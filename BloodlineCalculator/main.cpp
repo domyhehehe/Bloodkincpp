@@ -98,6 +98,8 @@ static inline std::string csvEscape(const std::string& s) {
     r.push_back('"');
     return r;
 }
+
+
 //=========================================================
 //  Depth (generation level) : founders=0, child=1+max(parents)
 //=========================================================
@@ -1005,6 +1007,75 @@ static inline void addPending(
     }
 }
 
+
+
+// ---- ContribMap <-> RocksDB シリアライズ ----
+static inline std::string kCsum(const std::string& childPk) {
+    return "CSUM|" + childPk;
+}
+
+// child の寄与マップを RocksDB から読み出し
+static bool loadContribMapFromDB(
+    const std::string& childPk,
+    std::unordered_map<std::string, double>& sumByAncestor,
+    double& sumF
+) {
+    if (!db) return false;
+
+    std::string val;
+    auto st = db->Get(rocksdb::ReadOptions(), kCsum(childPk), &val);
+    if (!st.ok()) return false;
+
+    sumByAncestor.clear();
+    sumF = 0.0;
+
+    std::stringstream ss(val);
+    std::string line;
+
+    // 1行目: sumF
+    if (!std::getline(ss, line)) return false;
+    try {
+        sumF = std::stod(line);
+    }
+    catch (...) {
+        return false;
+    }
+
+    // 2行目以降: ancPk,sum
+    while (std::getline(ss, line)) {
+        if (line.empty()) continue;
+        auto pos = line.find(',');
+        if (pos == std::string::npos) continue;
+
+        std::string ancPk = line.substr(0, pos);
+        std::string sumStr = line.substr(pos + 1);
+
+        double v = 0.0;
+        if (!s2d(sumStr, v)) continue;
+        sumByAncestor[ancPk] = v;
+    }
+
+    return true;
+}
+
+// child の寄与マップを RocksDB に保存
+static void storeContribMapToDB(
+    const std::string& childPk,
+    const std::unordered_map<std::string, double>& sumByAncestor,
+    double sumF
+) {
+    if (!db) return;
+
+    std::ostringstream oss;
+    oss << std::setprecision(17) << sumF << "\n";
+    for (auto const& kv : sumByAncestor) {
+        oss << kv.first << "," << d2s(kv.second) << "\n";
+    }
+
+    rocksdb::WriteOptions wo;
+    wo.disableWAL = true;
+    db->Put(wo, kCsum(childPk), oss.str());
+}
 // Compute sumByAncestor for F(child)=f(sire,dam) without path enumeration.
 static void computeInbreedingSumOnly_DAG(
     const std::string& childPk,
@@ -1013,6 +1084,7 @@ static void computeInbreedingSumOnly_DAG(
     bool& aborted,
     size_t maxStates = 200'000'000   // safety cap (pairs processed)
 ) {
+    std::cout << "[DEBUG] DAG start for " << childPk << "\n";  // ←追加
     sumByAncestor.clear();
     sumF = 0.0;
     aborted = false;
@@ -1108,29 +1180,42 @@ static void computeInbreedingSumOnly_DAG(
 void saveInbreedingTermsSumOnly_DAG(
     const std::string& filenameSum,
     const std::vector<std::string>& targets,
-    int /*maxDepth*/   // ← 使わないけど呼び出し側を崩さないため残す
+    int /*maxDepth*/
 ) {
     std::ofstream ofsS(filenameSum);
     if (!ofsS) { std::cerr << "cannot open " << filenameSum << "\n"; return; }
 
     ofsS << std::fixed << std::setprecision(12);
-    // ★ 余計な「Pct」「TermCount」を消す
     ofsS << "ChildHorse,ChildPK,CommonAncestor,CommonAncestorPK,SumContributionF\n";
 
     size_t idx = 0, total = targets.size();
 
     for (auto const& child : targets) {
         idx++;
-        std::cout << "[Sum] (" << idx << "/" << total << ") " << keyToDisplayName[child] << "\n";
+        std::cout << "[Sum] (" << idx << "/" << total << ") "
+            << keyToDisplayName[child] << "\n";
 
         std::unordered_map<std::string, double> sumByAnc;
         double sumF = 0.0;
         bool aborted = false;
 
-        computeInbreedingSumOnly_DAG(child, sumByAnc, sumF, aborted);
+        // ★ まず RocksDB から読んでみる
+        bool hit = loadContribMapFromDB(child, sumByAnc, sumF);
 
-        if (aborted) {
-            std::cout << "  [warn] DAG propagation aborted (maxStates hit)\n";
+        if (!hit) {
+            // キャッシュ無いなら DAG で計算
+            computeInbreedingSumOnly_DAG(child, sumByAnc, sumF, aborted);
+
+            if (aborted) {
+                std::cout << "  [warn] DAG propagation aborted (maxStates hit)\n";
+            }
+            else {
+                // 正常完走したときだけ RocksDB に保存
+                storeContribMapToDB(child, sumByAnc, sumF);
+            }
+        }
+        else {
+            std::cout << "  [cache] contrib map loaded from RocksDB\n";
         }
 
         std::vector<std::pair<std::string, double>> agg(sumByAnc.begin(), sumByAnc.end());
@@ -1139,12 +1224,14 @@ void saveInbreedingTermsSumOnly_DAG(
             return a.first < b.first;
             });
 
-        const std::string childName = keyToDisplayName.count(child) ? keyToDisplayName[child] : child;
+        const std::string childName =
+            keyToDisplayName.count(child) ? keyToDisplayName[child] : child;
 
         for (auto const& p : agg) {
             const std::string& anc = p.first;
             const double sum = p.second;
-            const std::string ancName = keyToDisplayName.count(anc) ? keyToDisplayName[anc] : anc;
+            const std::string ancName =
+                keyToDisplayName.count(anc) ? keyToDisplayName[anc] : anc;
 
             ofsS << csvEscape(childName) << "," << child << ","
                 << csvEscape(ancName) << "," << anc << ","
@@ -1163,6 +1250,7 @@ void saveInbreedingTermsSumOnly_DAG(
 
     std::cout << "[done] " << filenameSum << "\n";
 }
+
 
 void saveInbreedingTermsSumOnly(
     const std::string& filenameSum,
